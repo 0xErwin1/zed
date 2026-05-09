@@ -321,7 +321,7 @@ pub struct Style {
 }
 
 /// A 2D transform applied to a styled element subtree after layout.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ElementTransform {
     matrix: TransformationMatrix,
     origin: Point<f32>,
@@ -373,15 +373,6 @@ impl ElementTransform {
                 TransformationMatrix::unit()
                     .translate(point(ScaledPixels(-origin.x.0), ScaledPixels(-origin.y.0))),
             )
-    }
-}
-
-impl Default for ElementTransform {
-    fn default() -> Self {
-        Self {
-            matrix: TransformationMatrix::unit(),
-            origin: Point::default(),
-        }
     }
 }
 
