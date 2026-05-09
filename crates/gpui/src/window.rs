@@ -824,6 +824,7 @@ pub(crate) struct Frame {
 #[derive(Clone, Default)]
 pub(crate) struct PrepaintStateIndex {
     hitboxes_index: usize,
+    hitbox_transform_metadata_index: usize,
     tooltips_index: usize,
     deferred_draws_index: usize,
     dispatch_tree_index: usize,
@@ -2892,6 +2893,7 @@ impl Window {
     pub(crate) fn prepaint_index(&self) -> PrepaintStateIndex {
         PrepaintStateIndex {
             hitboxes_index: self.next_frame.hitboxes.len(),
+            hitbox_transform_metadata_index: self.next_frame.hitbox_transform_metadata.len(),
             tooltips_index: self.next_frame.tooltip_requests.len(),
             deferred_draws_index: self.next_frame.deferred_draws.len(),
             dispatch_tree_index: self.next_frame.dispatch_tree.len(),
@@ -2903,6 +2905,14 @@ impl Window {
     pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>) {
         self.next_frame.hitboxes.extend(
             self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
+                .iter()
+                .cloned(),
+        );
+        self.next_frame.hitbox_transform_metadata.extend(
+            self.rendered_frame.hitbox_transform_metadata[range
+                .start
+                .hitbox_transform_metadata_index
+                ..range.end.hitbox_transform_metadata_index]
                 .iter()
                 .cloned(),
         );
@@ -6046,7 +6056,7 @@ pub fn outline(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Element, Empty, InspectorElementId, IntoElement, TestAppContext};
+    use crate::{Element, Empty, InspectorElementId, IntoElement, TestAppContext, radians};
 
     struct TestQuadElement {
         bounds: Bounds<Pixels>,
@@ -6304,6 +6314,70 @@ mod tests {
         assert_eq!(inside_hit.hover_hitbox_count, 1);
         assert!(outside_hit.ids.is_empty());
         assert_eq!(outside_hit.hover_hitbox_count, 0);
+    }
+
+    #[gpui::test]
+    fn reuse_prepaint_preserves_transformed_hitbox_inverse_metadata(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Empty);
+        let window = window.into();
+
+        let (hitbox_id, reused_hitbox_ids, inside_hit, outside_local_hit) = cx
+            .update_window(window, |_, window, _| {
+                window.next_frame.hitboxes.clear();
+                window.next_frame.hitbox_transform_metadata.clear();
+                window.rendered_frame.hitboxes.clear();
+                window.rendered_frame.hitbox_transform_metadata.clear();
+                window.invalidator.set_phase(DrawPhase::Prepaint);
+
+                window.with_transform(
+                    TransformationMatrix::unit()
+                        .translate(point(ScaledPixels(100.), ScaledPixels(100.))),
+                    |window| {
+                        window.insert_hitbox(
+                            Bounds::new(point(px(0.), px(0.)), size(px(10.), px(10.))),
+                            HitboxBehavior::Normal,
+                        )
+                    },
+                );
+
+                let prepaint_start = window.prepaint_index();
+                let transform =
+                    TransformationMatrix::unit().rotate(radians(std::f32::consts::FRAC_PI_4));
+                let hitbox = window.with_transform(transform, |window| {
+                    window.insert_hitbox(
+                        Bounds::new(point(px(0.), px(0.)), size(px(10.), px(10.))),
+                        HitboxBehavior::Normal,
+                    )
+                });
+                let prepaint_end = window.prepaint_index();
+
+                window.rendered_frame.hitboxes = window.next_frame.hitboxes.clone();
+                window.rendered_frame.hitbox_transform_metadata =
+                    window.next_frame.hitbox_transform_metadata.clone();
+                window.next_frame.hitboxes.clear();
+                window.next_frame.hitbox_transform_metadata.clear();
+
+                window.reuse_prepaint(prepaint_start..prepaint_end);
+
+                let reused_hitbox_ids = window
+                    .next_frame
+                    .hitboxes
+                    .iter()
+                    .map(|hitbox| hitbox.id)
+                    .collect::<Vec<_>>();
+                let inside_hit = window.next_frame.hit_test(point(px(0.), px(7.)));
+                let outside_local_hit = window.next_frame.hit_test(point(px(6.), px(1.)));
+
+                window.invalidator.set_phase(DrawPhase::None);
+                (hitbox.id, reused_hitbox_ids, inside_hit, outside_local_hit)
+            })
+            .expect("test window should still exist");
+
+        assert_eq!(reused_hitbox_ids.as_slice(), &[hitbox_id]);
+        assert_eq!(inside_hit.ids.as_slice(), &[hitbox_id]);
+        assert_eq!(inside_hit.hover_hitbox_count, 1);
+        assert!(outside_local_hit.ids.is_empty());
+        assert_eq!(outside_local_hit.hover_hitbox_count, 0);
     }
 
     #[gpui::test]
