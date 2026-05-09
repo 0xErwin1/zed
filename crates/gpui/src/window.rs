@@ -2770,17 +2770,20 @@ impl Window {
                     .set_active_node(deferred_draw.parent_node);
 
                 let prepaint_start = self.prepaint_index();
+                let content_mask = deferred_draw.content_mask;
                 let transform = deferred_draw.transform;
                 if let Some(element) = deferred_draw.element.as_mut() {
                     self.with_rendered_view(deferred_draw.current_view, |window| {
                         window.with_transform(transform, |window| {
-                            window.with_rem_size(Some(deferred_draw.rem_size), |window| {
-                                window.with_absolute_element_offset(
-                                    deferred_draw.absolute_offset,
-                                    |window| {
-                                        element.prepaint(window, cx);
-                                    },
-                                );
+                            window.with_content_mask(content_mask, |window| {
+                                window.with_rem_size(Some(deferred_draw.rem_size), |window| {
+                                    window.with_absolute_element_offset(
+                                        deferred_draw.absolute_offset,
+                                        |window| {
+                                            element.prepaint(window, cx);
+                                        },
+                                    );
+                                });
                             });
                         });
                     })
@@ -6057,6 +6060,80 @@ mod tests {
         }
     }
 
+    struct TestHitboxElement {
+        bounds: Bounds<Pixels>,
+    }
+
+    impl TestHitboxElement {
+        fn new(bounds: Bounds<Pixels>) -> Self {
+            Self { bounds }
+        }
+    }
+
+    impl Element for TestHitboxElement {
+        type RequestLayoutState = ();
+        type PrepaintState = ();
+
+        fn id(&self) -> Option<ElementId> {
+            None
+        }
+
+        fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+            None
+        }
+
+        fn request_layout(
+            &mut self,
+            _id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> (LayoutId, Self::RequestLayoutState) {
+            let layout_id = window.request_layout(
+                Style {
+                    display: crate::Display::None,
+                    ..Default::default()
+                },
+                None,
+                cx,
+            );
+
+            (layout_id, ())
+        }
+
+        fn prepaint(
+            &mut self,
+            _id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            _bounds: Bounds<Pixels>,
+            _request_layout: &mut Self::RequestLayoutState,
+            window: &mut Window,
+            _cx: &mut App,
+        ) {
+            window.insert_hitbox(self.bounds, HitboxBehavior::Normal);
+        }
+
+        fn paint(
+            &mut self,
+            _id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            _bounds: Bounds<Pixels>,
+            _request_layout: &mut Self::RequestLayoutState,
+            _prepaint: &mut Self::PrepaintState,
+            _window: &mut Window,
+            _cx: &mut App,
+        ) {
+        }
+    }
+
+    impl IntoElement for TestHitboxElement {
+        type Element = Self;
+
+        fn into_element(self) -> Self::Element {
+            self
+        }
+    }
+
     #[gpui::test]
     fn window_with_transform_applies_to_painted_quad(cx: &mut TestAppContext) {
         let window = cx.add_window(|_, _| Empty);
@@ -6261,5 +6338,55 @@ mod tests {
             size(ScaledPixels(6.), ScaledPixels(8.))
         );
         assert!(immediate_quad.order < deferred_quad.order);
+    }
+
+    #[gpui::test]
+    fn defer_draw_prepaint_applies_content_mask_to_hitboxes(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Empty);
+        let current_view = window.root(cx).expect("root view should exist").entity_id();
+        let window = window.into();
+
+        cx.update_window(window, |_, window, cx| {
+            window.next_frame.dispatch_tree.clear();
+            window.invalidator.set_phase(DrawPhase::Prepaint);
+
+            let content_mask = ContentMask {
+                bounds: Bounds::new(point(px(0.), px(0.)), size(px(10.), px(10.))),
+            };
+            let inside_bounds = Bounds::new(point(px(2.), px(2.)), size(px(4.), px(4.)));
+            let outside_bounds = Bounds::new(point(px(20.), px(2.)), size(px(4.), px(4.)));
+
+            window.next_frame.dispatch_tree.push_node();
+            window.with_rendered_view(current_view, |window| {
+                let mut inside_element = TestHitboxElement::new(inside_bounds).into_any_element();
+                inside_element.request_layout(window, cx);
+                window.defer_draw(inside_element, point(px(0.), px(0.)), 0, Some(content_mask));
+
+                let mut outside_element = TestHitboxElement::new(outside_bounds).into_any_element();
+                outside_element.request_layout(window, cx);
+                window.defer_draw(
+                    outside_element,
+                    point(px(0.), px(0.)),
+                    1,
+                    Some(content_mask),
+                );
+            });
+            window.next_frame.dispatch_tree.pop_node();
+
+            window.prepaint_deferred_draws(cx);
+
+            let inside_hitbox = window.next_frame.hitboxes[0].clone();
+            let outside_hitbox = window.next_frame.hitboxes[1].clone();
+            let inside_hit_test = window.next_frame.hit_test(point(px(3.), px(3.)));
+            let outside_hit_test = window.next_frame.hit_test(point(px(21.), px(3.)));
+
+            assert!(inside_hit_test.ids.contains(&inside_hitbox.id));
+            assert!(!outside_hit_test.ids.contains(&outside_hitbox.id));
+            assert_eq!(inside_hitbox.content_mask, content_mask);
+            assert_eq!(outside_hitbox.content_mask, content_mask);
+
+            window.invalidator.set_phase(DrawPhase::None);
+        })
+        .expect("test window should still exist");
     }
 }
