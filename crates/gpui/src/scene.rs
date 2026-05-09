@@ -61,10 +61,19 @@ impl Scene {
     }
 
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
+        let bounds = transform_bounds(bounds, self.current_transform());
+        self.push_replayed_layer(bounds);
+    }
+
+    fn push_replayed_layer(&mut self, bounds: Bounds<ScaledPixels>) {
         let order = self.primitive_bounds.insert(bounds);
         self.layer_stack.push(order);
         self.paint_operations
             .push(PaintOperation::StartLayer(bounds));
+    }
+
+    pub(crate) fn push_transformed_layer(&mut self, bounds: Bounds<ScaledPixels>) {
+        self.push_replayed_layer(bounds);
     }
 
     pub fn pop_layer(&mut self) {
@@ -154,8 +163,13 @@ impl Scene {
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         for operation in &prev_scene.paint_operations[range] {
             match operation {
-                PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
-                PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
+                PaintOperation::Primitive(primitive) => {
+                    self.insert_transformed_primitive(
+                        primitive.clone(),
+                        TransformationMatrix::unit(),
+                    )
+                }
+                PaintOperation::StartLayer(bounds) => self.push_replayed_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
             }
         }
@@ -313,7 +327,7 @@ impl Primitive {
     }
 }
 
-fn transform_bounds(
+pub(crate) fn transform_bounds(
     bounds: Bounds<ScaledPixels>,
     transform: TransformationMatrix,
 ) -> Bounds<ScaledPixels> {
@@ -1060,6 +1074,55 @@ mod tests {
             nested_sprite.transformation,
             direct_sprite.transformation,
         );
+    }
+
+    #[test]
+    fn replay_preserves_previously_transformed_primitives() {
+        let transform =
+            TransformationMatrix::unit().translate(point(ScaledPixels(10.), ScaledPixels(20.)));
+
+        let mut previous_scene = Scene::default();
+        previous_scene.with_transform(transform, |scene| {
+            scene.insert_primitive(test_quad());
+        });
+
+        let mut replayed_scene = Scene::default();
+        replayed_scene.with_transform(transform, |scene| {
+            scene.replay(0..previous_scene.len(), &previous_scene);
+        });
+
+        assert_eq!(previous_scene.quads.len(), 1);
+        assert_eq!(replayed_scene.quads.len(), 1);
+
+        let Some(previous_quad) = previous_scene.quads.first() else {
+            panic!("previous scene should emit one quad");
+        };
+        let Some(replayed_quad) = replayed_scene.quads.first() else {
+            panic!("replayed scene should emit one quad");
+        };
+
+        assert_eq!(replayed_quad.bounds, previous_quad.bounds);
+    }
+
+    fn test_quad() -> Quad {
+        Quad {
+            order: 0,
+            border_style: BorderStyle::default(),
+            bounds: Bounds::new(
+                point(ScaledPixels(1.), ScaledPixels(2.)),
+                size(ScaledPixels(3.), ScaledPixels(4.)),
+            ),
+            content_mask: ContentMask {
+                bounds: Bounds::new(
+                    point(ScaledPixels(0.), ScaledPixels(0.)),
+                    size(ScaledPixels(100.), ScaledPixels(100.)),
+                ),
+            },
+            background: Background::default(),
+            border_color: Hsla::default(),
+            corner_radii: Corners::default(),
+            border_widths: Edges::default(),
+        }
     }
 
     fn test_sprite() -> MonochromeSprite {

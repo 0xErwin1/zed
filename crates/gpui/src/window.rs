@@ -782,6 +782,7 @@ pub(crate) struct DeferredDraw {
     text_style_stack: Vec<TextStyleRefinement>,
     content_mask: Option<ContentMask<Pixels>>,
     rem_size: Pixels,
+    transform: TransformationMatrix,
     element: Option<AnyElement>,
     absolute_offset: Point<Pixels>,
     prepaint_range: Range<PrepaintStateIndex>,
@@ -2769,15 +2770,18 @@ impl Window {
                     .set_active_node(deferred_draw.parent_node);
 
                 let prepaint_start = self.prepaint_index();
+                let transform = deferred_draw.transform;
                 if let Some(element) = deferred_draw.element.as_mut() {
                     self.with_rendered_view(deferred_draw.current_view, |window| {
-                        window.with_rem_size(Some(deferred_draw.rem_size), |window| {
-                            window.with_absolute_element_offset(
-                                deferred_draw.absolute_offset,
-                                |window| {
-                                    element.prepaint(window, cx);
-                                },
-                            );
+                        window.with_transform(transform, |window| {
+                            window.with_rem_size(Some(deferred_draw.rem_size), |window| {
+                                window.with_absolute_element_offset(
+                                    deferred_draw.absolute_offset,
+                                    |window| {
+                                        element.prepaint(window, cx);
+                                    },
+                                );
+                            });
                         });
                     })
                 } else {
@@ -2819,11 +2823,14 @@ impl Window {
 
             let paint_start = self.paint_index();
             let content_mask = deferred_draw.content_mask;
+            let transform = deferred_draw.transform;
             if let Some(element) = deferred_draw.element.as_mut() {
                 self.with_rendered_view(deferred_draw.current_view, |window| {
-                    window.with_content_mask(content_mask, |window| {
-                        window.with_rem_size(Some(deferred_draw.rem_size), |window| {
-                            element.paint(window, cx);
+                    window.with_transform(transform, |window| {
+                        window.with_content_mask(content_mask, |window| {
+                            window.with_rem_size(Some(deferred_draw.rem_size), |window| {
+                                element.paint(window, cx);
+                            });
                         });
                     })
                 })
@@ -2897,6 +2904,7 @@ impl Window {
                     text_style_stack: deferred_draw.text_style_stack.clone(),
                     content_mask: deferred_draw.content_mask,
                     rem_size: deferred_draw.rem_size,
+                    transform: deferred_draw.transform,
                     priority: deferred_draw.priority,
                     element: None,
                     absolute_offset: deferred_draw.absolute_offset,
@@ -3019,7 +3027,7 @@ impl Window {
     ) -> R {
         self.invalidator.debug_assert_paint_or_prepaint();
         if let Some(mask) = mask {
-            let mask = mask.intersect(&self.content_mask());
+            let mask = self.transform_content_mask(mask).intersect(&self.content_mask());
             self.content_mask_stack.push(mask);
             let result = f(self);
             self.content_mask_stack.pop();
@@ -3047,6 +3055,19 @@ impl Window {
     pub(crate) fn current_transform(&self) -> TransformationMatrix {
         self.invalidator.debug_assert_paint_or_prepaint();
         self.transform_stack.last().copied().unwrap_or_default()
+    }
+
+    fn transform_content_mask(&self, mask: ContentMask<Pixels>) -> ContentMask<Pixels> {
+        let transform = self.current_transform();
+        if transform == TransformationMatrix::unit() {
+            return mask;
+        }
+
+        let scale_factor = self.scale_factor();
+        let bounds = crate::scene::transform_bounds(mask.bounds.scale(scale_factor), transform)
+            .map(|value| px(value.0 / scale_factor));
+
+        ContentMask { bounds }
     }
 
     fn insert_primitive(&mut self, primitive: impl Into<crate::Primitive>) {
@@ -3422,6 +3443,7 @@ impl Window {
             text_style_stack: self.text_style_stack.clone(),
             content_mask,
             rem_size: self.rem_size(),
+            transform: self.current_transform(),
             priority,
             element: Some(element),
             absolute_offset,
@@ -3439,11 +3461,15 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let content_mask = self.content_mask();
-        let clipped_bounds = bounds.intersect(&content_mask.bounds);
+        let transformed_bounds = crate::scene::transform_bounds(
+            self.cover_bounds(bounds),
+            self.current_transform(),
+        );
+        let clipped_bounds = transformed_bounds.intersect(&self.cover_bounds(content_mask.bounds));
         if !clipped_bounds.is_empty() {
             self.next_frame
                 .scene
-                .push_layer(self.cover_bounds(clipped_bounds));
+                .push_transformed_layer(clipped_bounds);
         }
 
         let result = f(self);
@@ -5956,7 +5982,82 @@ pub fn outline(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Empty, TestAppContext};
+    use crate::{Element, Empty, InspectorElementId, IntoElement, TestAppContext};
+
+    struct TestQuadElement {
+        bounds: Bounds<Pixels>,
+        color: Hsla,
+    }
+
+    impl TestQuadElement {
+        fn new(bounds: Bounds<Pixels>, color: Hsla) -> Self {
+            Self { bounds, color }
+        }
+    }
+
+    impl Element for TestQuadElement {
+        type RequestLayoutState = ();
+        type PrepaintState = ();
+
+        fn id(&self) -> Option<ElementId> {
+            None
+        }
+
+        fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+            None
+        }
+
+        fn request_layout(
+            &mut self,
+            _id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> (LayoutId, Self::RequestLayoutState) {
+            let layout_id = window.request_layout(
+                Style {
+                    display: crate::Display::None,
+                    ..Default::default()
+                },
+                None,
+                cx,
+            );
+
+            (layout_id, ())
+        }
+
+        fn prepaint(
+            &mut self,
+            _id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            _bounds: Bounds<Pixels>,
+            _request_layout: &mut Self::RequestLayoutState,
+            _window: &mut Window,
+            _cx: &mut App,
+        ) {
+        }
+
+        fn paint(
+            &mut self,
+            _id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            _bounds: Bounds<Pixels>,
+            _request_layout: &mut Self::RequestLayoutState,
+            _prepaint: &mut Self::PrepaintState,
+            window: &mut Window,
+            _cx: &mut App,
+        ) {
+            window.paint_quad(fill(self.bounds, self.color));
+        }
+    }
+
+    impl IntoElement for TestQuadElement {
+        type Element = Self;
+
+        fn into_element(self) -> Self::Element {
+            self
+        }
+    }
 
     #[gpui::test]
     fn window_with_transform_applies_to_painted_quad(cx: &mut TestAppContext) {
@@ -5991,5 +6092,167 @@ mod tests {
         };
         assert_eq!(quad.bounds.origin, point(ScaledPixels(12.), ScaledPixels(24.)));
         assert_eq!(quad.bounds.size, size(ScaledPixels(6.), ScaledPixels(8.)));
+    }
+
+    #[gpui::test]
+    fn content_mask_entered_under_transform_clips_transformed_quad(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Empty);
+        let window = window.into();
+
+        let quads = cx
+            .update_window(window, |_, window, _| {
+                window.next_frame.scene.clear();
+                window.invalidator.set_phase(DrawPhase::Paint);
+
+                let transform = TransformationMatrix::unit()
+                    .translate(point(ScaledPixels(10.), ScaledPixels(20.)));
+                let mask = ContentMask {
+                    bounds: Bounds::new(point(px(1.), px(2.)), size(px(3.), px(4.))),
+                };
+
+                window.with_transform(transform, |window| {
+                    window.with_content_mask(Some(mask), |window| {
+                        window.paint_quad(fill(
+                            Bounds::new(point(px(1.), px(2.)), size(px(3.), px(4.))),
+                            Hsla::default(),
+                        ));
+                    });
+                });
+
+                assert_eq!(window.current_transform(), TransformationMatrix::default());
+                assert_eq!(window.content_mask_stack.len(), 0);
+
+                window.invalidator.set_phase(DrawPhase::None);
+                window.next_frame.scene.quads.clone()
+            })
+            .expect("test window should still exist");
+
+        assert_eq!(quads.len(), 1);
+
+        let Some(quad) = quads.first() else {
+            panic!("transformed mask should retain the transformed quad");
+        };
+        assert_eq!(quad.bounds.origin, point(ScaledPixels(12.), ScaledPixels(24.)));
+        assert_eq!(quad.bounds.size, size(ScaledPixels(6.), ScaledPixels(8.)));
+        assert_eq!(quad.content_mask.bounds.origin, quad.bounds.origin);
+        assert_eq!(quad.content_mask.bounds.size, quad.bounds.size);
+    }
+
+    #[gpui::test]
+    fn paint_layer_under_transform_uses_transformed_content_mask(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Empty);
+        let window = window.into();
+
+        let layer_bounds = cx
+            .update_window(window, |_, window, _| {
+                window.next_frame.scene.clear();
+                window.invalidator.set_phase(DrawPhase::Paint);
+
+                let transform = TransformationMatrix::unit()
+                    .translate(point(ScaledPixels(10.), ScaledPixels(20.)));
+                let mask = ContentMask {
+                    bounds: Bounds::new(point(px(1.), px(2.)), size(px(3.), px(4.))),
+                };
+
+                window.with_transform(transform, |window| {
+                    window.with_content_mask(Some(mask), |window| {
+                        window.paint_layer(
+                            Bounds::new(point(px(1.), px(2.)), size(px(3.), px(4.))),
+                            |window| {
+                                window.paint_quad(fill(
+                                    Bounds::new(point(px(1.), px(2.)), size(px(3.), px(4.))),
+                                    Hsla::default(),
+                                ));
+                            },
+                        );
+                    });
+                });
+
+                assert_eq!(window.current_transform(), TransformationMatrix::default());
+                assert_eq!(window.content_mask_stack.len(), 0);
+
+                window.invalidator.set_phase(DrawPhase::None);
+                window
+                    .next_frame
+                    .scene
+                    .paint_operations
+                    .iter()
+                    .find_map(|operation| match operation {
+                        crate::scene::PaintOperation::StartLayer(bounds) => Some(*bounds),
+                        _ => None,
+                    })
+            })
+            .expect("test window should still exist");
+
+        let Some(layer_bounds) = layer_bounds else {
+            panic!("transformed paint_layer should push a layer");
+        };
+        assert_eq!(layer_bounds.origin, point(ScaledPixels(12.), ScaledPixels(24.)));
+        assert_eq!(layer_bounds.size, size(ScaledPixels(6.), ScaledPixels(8.)));
+    }
+
+    #[gpui::test]
+    fn defer_draw_under_transform_preserves_z_order_and_transform_scope(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Empty);
+        let current_view = window.root(cx).expect("root view should exist").entity_id();
+        let window = window.into();
+
+        let quads = cx
+            .update_window(window, |_, window, cx| {
+                window.next_frame.scene.clear();
+                window.next_frame.dispatch_tree.clear();
+                window.invalidator.set_phase(DrawPhase::Prepaint);
+
+                let transform = TransformationMatrix::unit()
+                    .translate(point(ScaledPixels(10.), ScaledPixels(20.)));
+                let deferred_bounds = Bounds::new(point(px(1.), px(2.)), size(px(3.), px(4.)));
+                let immediate_bounds = Bounds::new(point(px(6.), px(12.)), size(px(3.), px(4.)));
+                let parent_node = window.next_frame.dispatch_tree.push_node();
+
+                window.with_rendered_view(current_view, |window| {
+                    window.with_transform(transform, |window| {
+                        let mut element = TestQuadElement::new(deferred_bounds, Hsla::default())
+                            .into_any_element();
+                        element.request_layout(window, cx);
+                        window.defer_draw(element, point(px(0.), px(0.)), 0, None);
+                    });
+                });
+
+                window.next_frame.dispatch_tree.pop_node();
+                assert_eq!(window.current_transform(), TransformationMatrix::default());
+                assert_eq!(window.next_frame.deferred_draws.len(), 1);
+                assert_eq!(window.next_frame.deferred_draws[0].parent_node, parent_node);
+
+                window.prepaint_deferred_draws(cx);
+
+                window.invalidator.set_phase(DrawPhase::Paint);
+                window.paint_quad(fill(immediate_bounds, Hsla::default()));
+                window.paint_deferred_draws(cx);
+
+                assert_eq!(window.current_transform(), TransformationMatrix::default());
+                window.invalidator.set_phase(DrawPhase::None);
+                window.next_frame.scene.quads.clone()
+            })
+            .expect("test window should still exist");
+
+        assert_eq!(quads.len(), 2);
+
+        let Some(immediate_quad) = quads.first() else {
+            panic!("immediate quad should be painted before deferred quad");
+        };
+        assert_eq!(
+            immediate_quad.bounds.origin,
+            point(ScaledPixels(12.), ScaledPixels(24.))
+        );
+
+        let Some(deferred_quad) = quads.get(1) else {
+            panic!("deferred quad should be painted after immediate quad");
+        };
+        assert_eq!(
+            deferred_quad.bounds.origin,
+            point(ScaledPixels(12.), ScaledPixels(24.))
+        );
+        assert_eq!(deferred_quad.bounds.size, size(ScaledPixels(6.), ScaledPixels(8.)));
+        assert!(immediate_quad.order < deferred_quad.order);
     }
 }
