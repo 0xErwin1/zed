@@ -28,6 +28,7 @@ pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
     primitive_bounds: BoundsTree<ScaledPixels>,
     layer_stack: Vec<DrawOrder>,
+    transform_stack: Vec<TransformationMatrix>,
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
     pub paths: Vec<Path<ScaledPixels>>,
@@ -44,6 +45,7 @@ impl Scene {
         self.paint_operations.clear();
         self.primitive_bounds.clear();
         self.layer_stack.clear();
+        self.transform_stack.clear();
         self.paths.clear();
         self.shadows.clear();
         self.quads.clear();
@@ -71,7 +73,15 @@ impl Scene {
     }
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
-        let mut primitive = primitive.into();
+        self.insert_transformed_primitive(primitive, self.current_transform());
+    }
+
+    pub(crate) fn insert_transformed_primitive(
+        &mut self,
+        primitive: impl Into<Primitive>,
+        transform: TransformationMatrix,
+    ) {
+        let mut primitive = primitive.into().transform(transform);
         let clipped_bounds = primitive
             .bounds()
             .intersect(&primitive.content_mask().bounds);
@@ -122,6 +132,23 @@ impl Scene {
         }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn with_transform<R>(
+        &mut self,
+        transform: TransformationMatrix,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let transform = self.current_transform().compose(transform);
+        self.transform_stack.push(transform);
+        let result = f(self);
+        self.transform_stack.pop();
+        result
+    }
+
+    pub(crate) fn current_transform(&self) -> TransformationMatrix {
+        self.transform_stack.last().copied().unwrap_or_default()
     }
 
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
@@ -243,6 +270,87 @@ impl Primitive {
             Primitive::Surface(surface) => &surface.content_mask,
         }
     }
+
+    fn transform(self, transform: TransformationMatrix) -> Self {
+        if transform == TransformationMatrix::unit() {
+            return self;
+        }
+
+        match self {
+            Primitive::Shadow(mut shadow) => {
+                shadow.bounds = transform_bounds(shadow.bounds, transform);
+                Primitive::Shadow(shadow)
+            }
+            Primitive::Quad(mut quad) => {
+                quad.bounds = transform_bounds(quad.bounds, transform);
+                Primitive::Quad(quad)
+            }
+            Primitive::Path(mut path) => {
+                path.transform(transform);
+                Primitive::Path(path)
+            }
+            Primitive::Underline(mut underline) => {
+                underline.bounds = transform_bounds(underline.bounds, transform);
+                Primitive::Underline(underline)
+            }
+            Primitive::MonochromeSprite(mut sprite) => {
+                sprite.transformation = transform.compose(sprite.transformation);
+                Primitive::MonochromeSprite(sprite)
+            }
+            Primitive::SubpixelSprite(mut sprite) => {
+                sprite.transformation = transform.compose(sprite.transformation);
+                Primitive::SubpixelSprite(sprite)
+            }
+            Primitive::PolychromeSprite(mut sprite) => {
+                sprite.bounds = transform_bounds(sprite.bounds, transform);
+                Primitive::PolychromeSprite(sprite)
+            }
+            Primitive::Surface(mut surface) => {
+                surface.bounds = transform_bounds(surface.bounds, transform);
+                Primitive::Surface(surface)
+            }
+        }
+    }
+}
+
+fn transform_bounds(
+    bounds: Bounds<ScaledPixels>,
+    transform: TransformationMatrix,
+) -> Bounds<ScaledPixels> {
+    let top_left = transform.apply_scaled(bounds.origin);
+    let top_right = transform.apply_scaled(point(bounds.right(), bounds.top()));
+    let bottom_left = transform.apply_scaled(point(bounds.left(), bounds.bottom()));
+    let bottom_right = transform.apply_scaled(point(bounds.right(), bounds.bottom()));
+
+    let left = top_left
+        .x
+        .0
+        .min(top_right.x.0)
+        .min(bottom_left.x.0)
+        .min(bottom_right.x.0);
+    let top = top_left
+        .y
+        .0
+        .min(top_right.y.0)
+        .min(bottom_left.y.0)
+        .min(bottom_right.y.0);
+    let right = top_left
+        .x
+        .0
+        .max(top_right.x.0)
+        .max(bottom_left.x.0)
+        .max(bottom_right.x.0);
+    let bottom = top_left
+        .y
+        .0
+        .max(top_right.y.0)
+        .max(bottom_left.y.0)
+        .max(bottom_right.y.0);
+
+    Bounds::from_corners(
+        point(ScaledPixels(left), ScaledPixels(top)),
+        point(ScaledPixels(right), ScaledPixels(bottom)),
+    )
 }
 
 #[cfg_attr(
@@ -644,6 +752,17 @@ impl TransformationMatrix {
         }
         Point::new(output[0].into(), output[1].into())
     }
+
+    fn apply_scaled(&self, point: Point<ScaledPixels>) -> Point<ScaledPixels> {
+        let input = [point.x.0, point.y.0];
+        let mut output = self.translation;
+        for (i, output_cell) in output.iter_mut().enumerate() {
+            for (k, input_cell) in input.iter().enumerate() {
+                *output_cell += self.rotation_scale[i][k] * *input_cell;
+            }
+        }
+        Point::new(ScaledPixels(output[0]), ScaledPixels(output[1]))
+    }
 }
 
 impl Default for TransformationMatrix {
@@ -869,9 +988,109 @@ where
     }
 }
 
+impl Path<ScaledPixels> {
+    fn transform(&mut self, transform: TransformationMatrix) {
+        self.bounds = transform_bounds(self.bounds.clone(), transform);
+        self.start = transform.apply_scaled(self.start);
+        self.current = transform.apply_scaled(self.current);
+
+        for vertex in &mut self.vertices {
+            vertex.xy_position = transform.apply_scaled(vertex.xy_position);
+        }
+    }
+}
+
 impl From<Path<ScaledPixels>> for Primitive {
     fn from(path: Path<ScaledPixels>) -> Self {
         Primitive::Path(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AtlasTextureKind, DevicePixels, TileId, size};
+
+    #[test]
+    fn transform_stack_composes_parent_then_child() {
+        let mut scene = Scene::default();
+        let parent =
+            TransformationMatrix::unit().translate(point(ScaledPixels(10.), ScaledPixels(0.)));
+        let child = TransformationMatrix::unit().scale(size(2., 2.));
+
+        scene.with_transform(parent, |scene| {
+            scene.with_transform(child, |scene| {
+                let transformed = scene.current_transform().apply(point(Pixels(3.), Pixels(4.)));
+
+                assert_eq!(transformed, point(Pixels(16.), Pixels(8.)));
+            });
+        });
+    }
+
+    #[test]
+    fn nested_transform_matches_direct_composed_sprite() {
+        let parent =
+            TransformationMatrix::unit().translate(point(ScaledPixels(10.), ScaledPixels(0.)));
+        let child = TransformationMatrix::unit().scale(size(2., 2.));
+        let direct_transform = parent.compose(child);
+
+        let mut direct_scene = Scene::default();
+        direct_scene.with_transform(direct_transform, |scene| {
+            scene.insert_primitive(test_sprite());
+        });
+
+        let mut nested_scene = Scene::default();
+        nested_scene.with_transform(parent, |scene| {
+            scene.with_transform(child, |scene| {
+                scene.insert_primitive(test_sprite());
+            });
+        });
+
+        assert_eq!(direct_scene.monochrome_sprites.len(), 1);
+        assert_eq!(nested_scene.monochrome_sprites.len(), 1);
+
+        let Some(direct_sprite) = direct_scene.monochrome_sprites.first() else {
+            panic!("direct scene should emit one monochrome sprite");
+        };
+        let Some(nested_sprite) = nested_scene.monochrome_sprites.first() else {
+            panic!("nested scene should emit one monochrome sprite");
+        };
+
+        assert_eq!(
+            nested_sprite.transformation,
+            direct_sprite.transformation,
+        );
+    }
+
+    fn test_sprite() -> MonochromeSprite {
+        MonochromeSprite {
+            order: 0,
+            pad: 0,
+            bounds: Bounds::new(
+                point(ScaledPixels(0.), ScaledPixels(0.)),
+                size(ScaledPixels(10.), ScaledPixels(10.)),
+            ),
+            content_mask: ContentMask {
+                bounds: Bounds::new(
+                    point(ScaledPixels(0.), ScaledPixels(0.)),
+                    size(ScaledPixels(100.), ScaledPixels(100.)),
+                ),
+            },
+            color: Hsla::default(),
+            tile: AtlasTile {
+                texture_id: AtlasTextureId {
+                    index: 0,
+                    kind: AtlasTextureKind::Monochrome,
+                },
+                tile_id: TileId(0),
+                padding: 0,
+                bounds: Bounds::new(
+                    point(DevicePixels(0), DevicePixels(0)),
+                    size(DevicePixels(10), DevicePixels(10)),
+                ),
+            },
+            transformation: TransformationMatrix::unit(),
+        }
     }
 }
 

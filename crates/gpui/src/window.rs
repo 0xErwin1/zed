@@ -976,6 +976,7 @@ pub struct Window {
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
+    pub(crate) transform_stack: Vec<TransformationMatrix>,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
@@ -1591,6 +1592,7 @@ impl Window {
             text_style_stack: Vec::new(),
             rendered_entity_stack: Vec::new(),
             element_offset_stack: Vec::new(),
+            transform_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
             requested_autoscroll: None,
@@ -3027,6 +3029,32 @@ impl Window {
         }
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn with_transform<R>(
+        &mut self,
+        transform: TransformationMatrix,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint_or_prepaint();
+
+        let transform = self.current_transform().compose(transform);
+        self.transform_stack.push(transform);
+        let result = f(self);
+        self.transform_stack.pop();
+        result
+    }
+
+    pub(crate) fn current_transform(&self) -> TransformationMatrix {
+        self.invalidator.debug_assert_paint_or_prepaint();
+        self.transform_stack.last().copied().unwrap_or_default()
+    }
+
+    fn insert_primitive(&mut self, primitive: impl Into<crate::Primitive>) {
+        self.next_frame
+            .scene
+            .insert_transformed_primitive(primitive, self.current_transform());
+    }
+
     /// Updates the global element offset relative to the current offset. This is used to implement
     /// scrolling. This method should only be called during the prepaint phase of element drawing.
     pub fn with_element_offset<R>(
@@ -3443,7 +3471,7 @@ impl Window {
         let opacity = self.element_opacity();
         for shadow in shadows {
             let shadow_bounds = (bounds + shadow.offset).dilate(shadow.spread_radius);
-            self.next_frame.scene.insert_primitive(Shadow {
+            self.insert_primitive(Shadow {
                 order: 0,
                 blur_radius: shadow.blur_radius.scale(scale_factor),
                 bounds: self.cover_bounds(shadow_bounds),
@@ -3469,7 +3497,7 @@ impl Window {
         let opacity = self.element_opacity();
         let snapped_bounds = self.snap_bounds(quad.bounds);
         let snapped_border_widths = self.snap_border_widths(quad.border_widths);
-        self.next_frame.scene.insert_primitive(Quad {
+        self.insert_primitive(Quad {
             order: 0,
             bounds: snapped_bounds,
             content_mask: self.snapped_content_mask(),
@@ -3493,9 +3521,7 @@ impl Window {
         path.content_mask = content_mask;
         let color: Background = color.into();
         path.color = color.opacity(opacity);
-        self.next_frame
-            .scene
-            .insert_primitive(path.scale(scale_factor));
+        self.insert_primitive(path.scale(scale_factor));
     }
 
     /// Paint an underline into the scene for the next frame at the current z-index.
@@ -3522,7 +3548,7 @@ impl Window {
         };
         let element_opacity = self.element_opacity();
 
-        self.next_frame.scene.insert_primitive(Underline {
+        self.insert_primitive(Underline {
             order: 0,
             pad: 0,
             bounds,
@@ -3552,7 +3578,7 @@ impl Window {
         };
         let opacity = self.element_opacity();
 
-        self.next_frame.scene.insert_primitive(Underline {
+        self.insert_primitive(Underline {
             order: 0,
             pad: 0,
             bounds,
@@ -3625,7 +3651,7 @@ impl Window {
             let content_mask = self.snapped_content_mask();
 
             if subpixel_rendering {
-                self.next_frame.scene.insert_primitive(SubpixelSprite {
+                self.insert_primitive(SubpixelSprite {
                     order: 0,
                     pad: 0,
                     bounds,
@@ -3635,7 +3661,7 @@ impl Window {
                     transformation: TransformationMatrix::unit(),
                 });
             } else {
-                self.next_frame.scene.insert_primitive(MonochromeSprite {
+                self.insert_primitive(MonochromeSprite {
                     order: 0,
                     pad: 0,
                     bounds,
@@ -3716,7 +3742,7 @@ impl Window {
             let content_mask = self.snapped_content_mask();
             let opacity = self.element_opacity();
 
-            self.next_frame.scene.insert_primitive(PolychromeSprite {
+            self.insert_primitive(PolychromeSprite {
                 order: 0,
                 pad: 0,
                 grayscale: false,
@@ -3782,7 +3808,7 @@ impl Window {
             .map_origin(|value| ScaledPixels(round_half_toward_zero(value.0)))
             .map_size(|size| size.ceil());
 
-        self.next_frame.scene.insert_primitive(MonochromeSprite {
+        self.insert_primitive(MonochromeSprite {
             order: 0,
             pad: 0,
             bounds: final_bounds,
@@ -3831,7 +3857,7 @@ impl Window {
         let corner_radii = corner_radii.scale(self.scale_factor());
         let opacity = self.element_opacity();
 
-        self.next_frame.scene.insert_primitive(PolychromeSprite {
+        self.insert_primitive(PolychromeSprite {
             order: 0,
             pad: 0,
             grayscale,
@@ -3855,7 +3881,7 @@ impl Window {
 
         let bounds = self.snap_bounds(bounds);
         let content_mask = self.snapped_content_mask();
-        self.next_frame.scene.insert_primitive(PaintSurface {
+        self.insert_primitive(PaintSurface {
             order: 0,
             bounds,
             content_mask,
@@ -5924,5 +5950,46 @@ pub fn outline(
         border_widths: (1.).into(),
         border_color: border_color.into(),
         border_style,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Empty, TestAppContext};
+
+    #[gpui::test]
+    fn window_with_transform_applies_to_painted_quad(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Empty);
+        let window = window.into();
+
+        let quads = cx
+            .update_window(window, |_, window, _| {
+                window.next_frame.scene.clear();
+                window.invalidator.set_phase(DrawPhase::Paint);
+
+                let transform = TransformationMatrix::unit()
+                    .translate(point(ScaledPixels(10.), ScaledPixels(20.)));
+                window.with_transform(transform, |window| {
+                    window.paint_quad(fill(
+                        Bounds::new(point(px(1.), px(2.)), size(px(3.), px(4.))),
+                        Hsla::default(),
+                    ));
+                });
+
+                assert_eq!(window.current_transform(), TransformationMatrix::default());
+
+                window.invalidator.set_phase(DrawPhase::None);
+                window.next_frame.scene.quads.clone()
+            })
+            .expect("test window should still exist");
+
+        assert_eq!(quads.len(), 1);
+
+        let Some(quad) = quads.first() else {
+            panic!("window transform should emit one quad");
+        };
+        assert_eq!(quad.bounds.origin, point(ScaledPixels(12.), ScaledPixels(24.)));
+        assert_eq!(quad.bounds.size, size(ScaledPixels(6.), ScaledPixels(8.)));
     }
 }
