@@ -655,6 +655,14 @@ pub struct Hitbox {
     pub behavior: HitboxBehavior,
 }
 
+#[derive(Clone, Debug)]
+struct HitboxTransformMetadata {
+    id: HitboxId,
+    local_bounds: Bounds<Pixels>,
+    inverse_transform: Option<TransformationMatrix>,
+    scale_factor: f32,
+}
+
 impl Hitbox {
     /// Checks if the hitbox is currently hovered. Returns `false` during keyboard input modality
     /// so that keyboard navigation suppresses hover highlights. Except when handling
@@ -798,6 +806,7 @@ pub(crate) struct Frame {
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
     pub(crate) hitboxes: Vec<Hitbox>,
+    hitbox_transform_metadata: Vec<HitboxTransformMetadata>,
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
     pub(crate) deferred_draws: Vec<DeferredDraw>,
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
@@ -844,6 +853,7 @@ impl Frame {
             dispatch_tree,
             scene: Scene::default(),
             hitboxes: Vec::new(),
+            hitbox_transform_metadata: Vec::new(),
             window_control_hitboxes: Vec::new(),
             deferred_draws: Vec::new(),
             input_handlers: Vec::new(),
@@ -872,6 +882,7 @@ impl Frame {
         self.tooltip_requests.clear();
         self.cursor_styles.clear();
         self.hitboxes.clear();
+        self.hitbox_transform_metadata.clear();
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
         self.tab_stops.clear();
@@ -908,8 +919,7 @@ impl Frame {
         let mut set_hover_hitbox_count = false;
         let mut hit_test = HitTest::default();
         for hitbox in self.hitboxes.iter().rev() {
-            let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
-            if bounds.contains(&position) {
+            if self.hitbox_contains_position(hitbox, position) {
                 hit_test.ids.push(hitbox.id);
                 if !set_hover_hitbox_count
                     && hitbox.behavior == HitboxBehavior::BlockMouseExceptScroll
@@ -926,6 +936,31 @@ impl Frame {
             hit_test.hover_hitbox_count = hit_test.ids.len();
         }
         hit_test
+    }
+
+    fn hitbox_contains_position(&self, hitbox: &Hitbox, position: Point<Pixels>) -> bool {
+        let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
+        if !bounds.contains(&position) {
+            return false;
+        }
+
+        let Some(metadata) = self
+            .hitbox_transform_metadata
+            .iter()
+            .find(|metadata| metadata.id == hitbox.id)
+        else {
+            return true;
+        };
+
+        let Some(inverse_transform) = metadata.inverse_transform else {
+            return false;
+        };
+
+        let local_position = inverse_transform
+            .apply_scaled(position.scale(metadata.scale_factor))
+            .map(|value| px(value.0 / metadata.scale_factor));
+
+        metadata.local_bounds.contains(&local_position)
     }
 
     pub(crate) fn focus_path(&self) -> SmallVec<[FocusId; 8]> {
@@ -3075,6 +3110,20 @@ impl Window {
         ContentMask { bounds }
     }
 
+    fn transform_hitbox_bounds(
+        &self,
+        bounds: Bounds<Pixels>,
+        transform: TransformationMatrix,
+    ) -> Bounds<Pixels> {
+        if transform == TransformationMatrix::unit() {
+            return bounds;
+        }
+
+        let scale_factor = self.scale_factor();
+        crate::scene::transform_bounds(bounds.scale(scale_factor), transform)
+            .map(|value| px(value.0 / scale_factor))
+    }
+
     fn insert_primitive(&mut self, primitive: impl Into<crate::Primitive>) {
         self.next_frame
             .scene
@@ -4026,14 +4075,28 @@ impl Window {
         self.invalidator.debug_assert_prepaint();
 
         let content_mask = self.content_mask();
+        let transform = self.current_transform();
         let mut id = self.next_hitbox_id;
         self.next_hitbox_id = self.next_hitbox_id.next();
+        let transformed_bounds = self.transform_hitbox_bounds(bounds, transform);
         let hitbox = Hitbox {
             id,
-            bounds,
+            bounds: transformed_bounds,
             content_mask,
             behavior,
         };
+
+        if transform != TransformationMatrix::unit() {
+            self.next_frame
+                .hitbox_transform_metadata
+                .push(HitboxTransformMetadata {
+                    id,
+                    local_bounds: bounds,
+                    inverse_transform: transform.inverse(),
+                    scale_factor: self.scale_factor(),
+                });
+        }
+
         self.next_frame.hitboxes.push(hitbox.clone());
         hitbox
     }
@@ -6170,6 +6233,106 @@ mod tests {
             point(ScaledPixels(12.), ScaledPixels(24.))
         );
         assert_eq!(quad.bounds.size, size(ScaledPixels(6.), ScaledPixels(8.)));
+    }
+
+    #[gpui::test]
+    fn hit_test_uses_transformed_visual_region(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Empty);
+        let window = window.into();
+
+        let (hitbox_id, hitbox_bounds, visual_hit, local_hit) = cx
+            .update_window(window, |_, window, _| {
+                window.next_frame.hitboxes.clear();
+                window.invalidator.set_phase(DrawPhase::Prepaint);
+
+                let transform = TransformationMatrix::unit()
+                    .translate(point(ScaledPixels(10.), ScaledPixels(20.)));
+                let hitbox = window.with_transform(transform, |window| {
+                    window.insert_hitbox(
+                        Bounds::new(point(px(1.), px(2.)), size(px(3.), px(4.))),
+                        HitboxBehavior::Normal,
+                    )
+                });
+
+                assert_eq!(window.current_transform(), TransformationMatrix::default());
+
+                let visual_hit = window.next_frame.hit_test(point(px(6.), px(12.)));
+                let local_hit = window.next_frame.hit_test(point(px(1.), px(2.)));
+
+                window.invalidator.set_phase(DrawPhase::None);
+                (hitbox.id, hitbox.bounds, visual_hit, local_hit)
+            })
+            .expect("test window should still exist");
+
+        assert_eq!(hitbox_bounds.origin, point(px(6.), px(12.)));
+        assert_eq!(hitbox_bounds.size, size(px(3.), px(4.)));
+        assert_eq!(visual_hit.ids.as_slice(), &[hitbox_id]);
+        assert_eq!(visual_hit.hover_hitbox_count, 1);
+        assert!(local_hit.ids.is_empty());
+        assert_eq!(local_hit.hover_hitbox_count, 0);
+    }
+
+    #[gpui::test]
+    fn hit_test_inverse_maps_scaled_visual_region(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Empty);
+        let window = window.into();
+
+        let (hitbox_id, hitbox_bounds, inside_hit, outside_hit) = cx
+            .update_window(window, |_, window, _| {
+                window.next_frame.hitboxes.clear();
+                window.invalidator.set_phase(DrawPhase::Prepaint);
+
+                let transform = TransformationMatrix::unit().scale(size(2., 2.));
+                let hitbox = window.with_transform(transform, |window| {
+                    window.insert_hitbox(
+                        Bounds::new(point(px(2.), px(3.)), size(px(4.), px(5.))),
+                        HitboxBehavior::Normal,
+                    )
+                });
+
+                let inside_hit = window.next_frame.hit_test(point(px(10.), px(12.)));
+                let outside_hit = window.next_frame.hit_test(point(px(13.), px(17.)));
+
+                window.invalidator.set_phase(DrawPhase::None);
+                (hitbox.id, hitbox.bounds, inside_hit, outside_hit)
+            })
+            .expect("test window should still exist");
+
+        assert_eq!(hitbox_bounds.origin, point(px(4.), px(6.)));
+        assert_eq!(hitbox_bounds.size, size(px(8.), px(10.)));
+        assert_eq!(inside_hit.ids.as_slice(), &[hitbox_id]);
+        assert_eq!(inside_hit.hover_hitbox_count, 1);
+        assert!(outside_hit.ids.is_empty());
+        assert_eq!(outside_hit.hover_hitbox_count, 0);
+    }
+
+    #[gpui::test]
+    fn non_transformed_hit_test_still_uses_inserted_bounds(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Empty);
+        let window = window.into();
+
+        let (hitbox_id, inside_hit, outside_hit) = cx
+            .update_window(window, |_, window, _| {
+                window.next_frame.hitboxes.clear();
+                window.invalidator.set_phase(DrawPhase::Prepaint);
+
+                let hitbox = window.insert_hitbox(
+                    Bounds::new(point(px(1.), px(2.)), size(px(3.), px(4.))),
+                    HitboxBehavior::Normal,
+                );
+
+                let inside_hit = window.next_frame.hit_test(point(px(1.), px(2.)));
+                let outside_hit = window.next_frame.hit_test(point(px(6.), px(12.)));
+
+                window.invalidator.set_phase(DrawPhase::None);
+                (hitbox.id, inside_hit, outside_hit)
+            })
+            .expect("test window should still exist");
+
+        assert_eq!(inside_hit.ids.as_slice(), &[hitbox_id]);
+        assert_eq!(inside_hit.hover_hitbox_count, 1);
+        assert!(outside_hit.ids.is_empty());
+        assert_eq!(outside_hit.hover_hitbox_count, 0);
     }
 
     #[gpui::test]
