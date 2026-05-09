@@ -69,6 +69,7 @@ pub use prompts::*;
 const MIN_TEXT_RASTER_TRANSFORM_MULTIPLIER: f32 = 1.0;
 const MAX_TEXT_RASTER_TRANSFORM_MULTIPLIER: f32 = 4.0;
 const TEXT_RASTER_TRANSFORM_MULTIPLIER_STEP: f32 = 0.125;
+const SUBPIXEL_SAFE_TRANSFORM_EPSILON: f32 = 0.001;
 
 fn transform_raster_multiplier(transform: TransformationMatrix) -> f32 {
     let [[xx, xy], [yx, yy]] = transform.rotation_scale;
@@ -93,6 +94,36 @@ fn glyph_raster_scale_factor(scale_factor: f32, transform: TransformationMatrix)
     scale_factor * transform_raster_multiplier(transform)
 }
 
+fn transform_allows_subpixel_rendering(transform: TransformationMatrix) -> bool {
+    let [[xx, xy], [yx, yy]] = transform.rotation_scale;
+    let x_scale = xx.hypot(yx);
+    let y_scale = xy.hypot(yy);
+
+    if !x_scale.is_finite() || !y_scale.is_finite() {
+        return false;
+    }
+
+    if !approximately_zero(xy) || !approximately_zero(yx) {
+        return false;
+    }
+
+    if xx <= 0.0 || yy <= 0.0 || !approximately_equal(x_scale, y_scale) {
+        return false;
+    }
+
+    let rounded_scale = x_scale.round();
+    rounded_scale >= MIN_TEXT_RASTER_TRANSFORM_MULTIPLIER
+        && approximately_equal(x_scale, rounded_scale)
+}
+
+fn approximately_zero(value: f32) -> bool {
+    value.abs() <= SUBPIXEL_SAFE_TRANSFORM_EPSILON
+}
+
+fn approximately_equal(left: f32, right: f32) -> bool {
+    (left - right).abs() <= SUBPIXEL_SAFE_TRANSFORM_EPSILON
+}
+
 fn compensate_glyph_sprite_bounds(
     bounds: Bounds<ScaledPixels>,
     raster_multiplier: f32,
@@ -102,6 +133,18 @@ fn compensate_glyph_sprite_bounds(
     }
 
     bounds.map(|value| ScaledPixels(value.0 / raster_multiplier))
+}
+
+#[cfg(test)]
+fn transformed_glyph_visual_bounds(
+    raster_bounds: Bounds<ScaledPixels>,
+    transform: TransformationMatrix,
+) -> Bounds<ScaledPixels> {
+    let raster_multiplier = transform_raster_multiplier(transform);
+    crate::scene::transform_bounds(
+        compensate_glyph_sprite_bounds(raster_bounds, raster_multiplier),
+        transform,
+    )
 }
 
 /// Default window size used when no explicit size is provided.
@@ -3831,6 +3874,10 @@ impl Window {
             return false;
         }
 
+        if !transform_allows_subpixel_rendering(self.current_transform()) {
+            return false;
+        }
+
         let mode = match self.text_rendering_mode.get() {
             TextRenderingMode::PlatformDefault => self
                 .text_system()
@@ -6524,6 +6571,51 @@ mod tests {
         assert_eq!(
             compensated_bounds.size,
             size(ScaledPixels(10.0), ScaledPixels(15.0))
+        );
+    }
+
+    #[test]
+    fn transform_subpixel_policy_rejects_fractional_and_anisotropic_scale() {
+        assert!(!transform_allows_subpixel_rendering(
+            TransformationMatrix::unit().scale(size(1.25, 1.25))
+        ));
+        assert!(!transform_allows_subpixel_rendering(
+            TransformationMatrix::unit().scale(size(2.0, 1.0))
+        ));
+        assert!(!transform_allows_subpixel_rendering(
+            TransformationMatrix::unit().scale(size(1.0, 2.0))
+        ));
+    }
+
+    #[test]
+    fn transform_subpixel_policy_preserves_unit_and_integer_safe_scale() {
+        assert!(transform_allows_subpixel_rendering(
+            TransformationMatrix::unit()
+        ));
+        assert!(transform_allows_subpixel_rendering(
+            TransformationMatrix::unit().scale(size(2.0, 2.0))
+        ));
+        assert!(transform_allows_subpixel_rendering(
+            TransformationMatrix::unit()
+                .scale(size(2.0, 2.0))
+                .translate(point(ScaledPixels(100.0), ScaledPixels(50.0)))
+        ));
+    }
+
+    #[test]
+    fn transformed_glyph_visual_bounds_match_scaled_layout_bounds() {
+        let raster_bounds = Bounds::new(
+            point(ScaledPixels(4.0), ScaledPixels(6.0)),
+            size(ScaledPixels(20.0), ScaledPixels(30.0)),
+        );
+        let transform = TransformationMatrix::unit().scale(size(2.0, 2.0));
+
+        assert_eq!(
+            transformed_glyph_visual_bounds(raster_bounds, transform),
+            Bounds::new(
+                point(ScaledPixels(4.0), ScaledPixels(6.0)),
+                size(ScaledPixels(20.0), ScaledPixels(30.0))
+            )
         );
     }
 
