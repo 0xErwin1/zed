@@ -92,7 +92,7 @@ impl Scene {
     ) {
         let mut primitive = primitive.into().transform(transform);
         let clipped_bounds = primitive
-            .bounds()
+            .visual_bounds()
             .intersect(&primitive.content_mask().bounds);
 
         if clipped_bounds.is_empty() {
@@ -163,12 +163,8 @@ impl Scene {
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         for operation in &prev_scene.paint_operations[range] {
             match operation {
-                PaintOperation::Primitive(primitive) => {
-                    self.insert_transformed_primitive(
-                        primitive.clone(),
-                        TransformationMatrix::unit(),
-                    )
-                }
+                PaintOperation::Primitive(primitive) => self
+                    .insert_transformed_primitive(primitive.clone(), TransformationMatrix::unit()),
                 PaintOperation::StartLayer(bounds) => self.push_replayed_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
             }
@@ -282,6 +278,18 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
+        }
+    }
+
+    fn visual_bounds(&self) -> Bounds<ScaledPixels> {
+        match self {
+            Primitive::MonochromeSprite(sprite) => {
+                transform_bounds(sprite.bounds, sprite.transformation)
+            }
+            Primitive::SubpixelSprite(sprite) => {
+                transform_bounds(sprite.bounds, sprite.transformation)
+            }
+            _ => *self.bounds(),
         }
     }
 
@@ -1004,7 +1012,7 @@ where
 
 impl Path<ScaledPixels> {
     fn transform(&mut self, transform: TransformationMatrix) {
-        self.bounds = transform_bounds(self.bounds.clone(), transform);
+        self.bounds = transform_bounds(self.bounds, transform);
         self.start = transform.apply_scaled(self.start);
         self.current = transform.apply_scaled(self.current);
 
@@ -1034,7 +1042,9 @@ mod tests {
 
         scene.with_transform(parent, |scene| {
             scene.with_transform(child, |scene| {
-                let transformed = scene.current_transform().apply(point(Pixels(3.), Pixels(4.)));
+                let transformed = scene
+                    .current_transform()
+                    .apply(point(Pixels(3.), Pixels(4.)));
 
                 assert_eq!(transformed, point(Pixels(16.), Pixels(8.)));
             });
@@ -1070,10 +1080,7 @@ mod tests {
             panic!("nested scene should emit one monochrome sprite");
         };
 
-        assert_eq!(
-            nested_sprite.transformation,
-            direct_sprite.transformation,
-        );
+        assert_eq!(nested_sprite.transformation, direct_sprite.transformation,);
     }
 
     #[test]
@@ -1102,6 +1109,58 @@ mod tests {
         };
 
         assert_eq!(replayed_quad.bounds, previous_quad.bounds);
+    }
+
+    #[test]
+    fn transformed_monochrome_sprite_is_culled_by_visual_bounds() {
+        let transform =
+            TransformationMatrix::unit().translate(point(ScaledPixels(100.), ScaledPixels(0.)));
+
+        let mut sprite = test_sprite();
+        sprite.content_mask = ContentMask {
+            bounds: Bounds::new(
+                point(ScaledPixels(100.), ScaledPixels(0.)),
+                size(ScaledPixels(10.), ScaledPixels(10.)),
+            ),
+        };
+
+        let mut scene = Scene::default();
+        scene.insert_transformed_primitive(sprite, transform);
+
+        assert_eq!(scene.monochrome_sprites.len(), 1);
+
+        let Some(sprite) = scene.monochrome_sprites.first() else {
+            panic!("scene should emit one transformed monochrome sprite");
+        };
+
+        assert_eq!(sprite.bounds, test_sprite().bounds);
+        assert_eq!(sprite.transformation, transform);
+    }
+
+    #[test]
+    fn transformed_subpixel_sprite_is_culled_by_visual_bounds() {
+        let transform =
+            TransformationMatrix::unit().translate(point(ScaledPixels(0.), ScaledPixels(100.)));
+
+        let mut sprite = test_subpixel_sprite();
+        sprite.content_mask = ContentMask {
+            bounds: Bounds::new(
+                point(ScaledPixels(0.), ScaledPixels(100.)),
+                size(ScaledPixels(10.), ScaledPixels(10.)),
+            ),
+        };
+
+        let mut scene = Scene::default();
+        scene.insert_transformed_primitive(sprite, transform);
+
+        assert_eq!(scene.subpixel_sprites.len(), 1);
+
+        let Some(sprite) = scene.subpixel_sprites.first() else {
+            panic!("scene should emit one transformed subpixel sprite");
+        };
+
+        assert_eq!(sprite.bounds, test_subpixel_sprite().bounds);
+        assert_eq!(sprite.transformation, transform);
     }
 
     fn test_quad() -> Quad {
@@ -1153,6 +1212,20 @@ mod tests {
                 ),
             },
             transformation: TransformationMatrix::unit(),
+        }
+    }
+
+    fn test_subpixel_sprite() -> SubpixelSprite {
+        let sprite = test_sprite();
+
+        SubpixelSprite {
+            order: sprite.order,
+            pad: sprite.pad,
+            bounds: sprite.bounds,
+            content_mask: sprite.content_mask,
+            color: sprite.color,
+            tile: sprite.tile,
+            transformation: sprite.transformation,
         }
     }
 }

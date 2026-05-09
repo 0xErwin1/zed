@@ -3027,7 +3027,9 @@ impl Window {
     ) -> R {
         self.invalidator.debug_assert_paint_or_prepaint();
         if let Some(mask) = mask {
-            let mask = self.transform_content_mask(mask).intersect(&self.content_mask());
+            let mask = self
+                .transform_content_mask(mask)
+                .intersect(&self.content_mask());
             self.content_mask_stack.push(mask);
             let result = f(self);
             self.content_mask_stack.pop();
@@ -3461,15 +3463,11 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let content_mask = self.content_mask();
-        let transformed_bounds = crate::scene::transform_bounds(
-            self.cover_bounds(bounds),
-            self.current_transform(),
-        );
+        let transformed_bounds =
+            crate::scene::transform_bounds(self.cover_bounds(bounds), self.current_transform());
         let clipped_bounds = transformed_bounds.intersect(&self.cover_bounds(content_mask.bounds));
         if !clipped_bounds.is_empty() {
-            self.next_frame
-                .scene
-                .push_transformed_layer(clipped_bounds);
+            self.next_frame.scene.push_transformed_layer(clipped_bounds);
         }
 
         let result = f(self);
@@ -6090,7 +6088,10 @@ mod tests {
         let Some(quad) = quads.first() else {
             panic!("window transform should emit one quad");
         };
-        assert_eq!(quad.bounds.origin, point(ScaledPixels(12.), ScaledPixels(24.)));
+        assert_eq!(
+            quad.bounds.origin,
+            point(ScaledPixels(12.), ScaledPixels(24.))
+        );
         assert_eq!(quad.bounds.size, size(ScaledPixels(6.), ScaledPixels(8.)));
     }
 
@@ -6132,7 +6133,10 @@ mod tests {
         let Some(quad) = quads.first() else {
             panic!("transformed mask should retain the transformed quad");
         };
-        assert_eq!(quad.bounds.origin, point(ScaledPixels(12.), ScaledPixels(24.)));
+        assert_eq!(
+            quad.bounds.origin,
+            point(ScaledPixels(12.), ScaledPixels(24.))
+        );
         assert_eq!(quad.bounds.size, size(ScaledPixels(6.), ScaledPixels(8.)));
         assert_eq!(quad.content_mask.bounds.origin, quad.bounds.origin);
         assert_eq!(quad.content_mask.bounds.size, quad.bounds.size);
@@ -6172,22 +6176,22 @@ mod tests {
                 assert_eq!(window.content_mask_stack.len(), 0);
 
                 window.invalidator.set_phase(DrawPhase::None);
-                window
-                    .next_frame
-                    .scene
-                    .paint_operations
-                    .iter()
-                    .find_map(|operation| match operation {
+                window.next_frame.scene.paint_operations.iter().find_map(
+                    |operation| match operation {
                         crate::scene::PaintOperation::StartLayer(bounds) => Some(*bounds),
                         _ => None,
-                    })
+                    },
+                )
             })
             .expect("test window should still exist");
 
         let Some(layer_bounds) = layer_bounds else {
             panic!("transformed paint_layer should push a layer");
         };
-        assert_eq!(layer_bounds.origin, point(ScaledPixels(12.), ScaledPixels(24.)));
+        assert_eq!(
+            layer_bounds.origin,
+            point(ScaledPixels(12.), ScaledPixels(24.))
+        );
         assert_eq!(layer_bounds.size, size(ScaledPixels(6.), ScaledPixels(8.)));
     }
 
@@ -6252,7 +6256,10 @@ mod tests {
             deferred_quad.bounds.origin,
             point(ScaledPixels(12.), ScaledPixels(24.))
         );
-        assert_eq!(deferred_quad.bounds.size, size(ScaledPixels(6.), ScaledPixels(8.)));
+        assert_eq!(
+            deferred_quad.bounds.size,
+            size(ScaledPixels(6.), ScaledPixels(8.))
+        );
         assert!(immediate_quad.order < deferred_quad.order);
     }
 }
