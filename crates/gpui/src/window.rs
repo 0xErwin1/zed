@@ -4,21 +4,21 @@ use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow, Capslock,
     Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
-    DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
-    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
-    KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
-    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
-    WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems, size,
-    transparent_black,
+    DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect,
+    ElementTransform, Entity, EntityId, EventEmitter, FileDropEvent, FontId, Global,
+    GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, IsZero, KeyBinding, KeyContext,
+    KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers,
+    ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent,
+    Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
+    PlatformWindow, Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render,
+    RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
+    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow,
+    SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
+    SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
+    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
+    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point,
+    prelude::*, px, rems, size, transparent_black,
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
@@ -3102,6 +3102,19 @@ impl Window {
         result
     }
 
+    pub(crate) fn with_style_transform<R>(
+        &mut self,
+        transform: Option<ElementTransform>,
+        bounds: Bounds<Pixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        if let Some(transform) = transform {
+            self.with_transform(transform.resolve(bounds, self.scale_factor()), f)
+        } else {
+            f(self)
+        }
+    }
+
     pub(crate) fn current_transform(&self) -> TransformationMatrix {
         self.invalidator.debug_assert_paint_or_prepaint();
         self.transform_stack.last().copied().unwrap_or_default()
@@ -6056,7 +6069,10 @@ pub fn outline(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Element, Empty, InspectorElementId, IntoElement, TestAppContext, radians};
+    use crate::{
+        Element, ElementTransform, Empty, InspectorElementId, IntoElement, ParentElement, Styled,
+        TestAppContext, div, radians,
+    };
 
     struct TestQuadElement {
         bounds: Bounds<Pixels>,
@@ -6205,6 +6221,131 @@ mod tests {
         fn into_element(self) -> Self::Element {
             self
         }
+    }
+
+    fn paint_test_root(root: impl IntoElement, cx: &mut TestAppContext) -> Vec<Quad> {
+        let window = cx.add_window(|_, _| Empty);
+        let current_view = window.root(cx).expect("root view should exist").entity_id();
+        let window = window.into();
+
+        cx.update_window(window, |_, window, cx| {
+            window.next_frame.scene.clear();
+            window.next_frame.dispatch_tree.clear();
+
+            let mut root = root.into_any_element();
+            window.with_rendered_view(current_view, |window| {
+                window.invalidator.set_phase(DrawPhase::Prepaint);
+                root.prepaint_as_root(
+                    Point::default(),
+                    size(px(100.), px(100.)).into(),
+                    window,
+                    cx,
+                );
+
+                window.invalidator.set_phase(DrawPhase::Paint);
+                root.paint(window, cx);
+            });
+
+            window.invalidator.set_phase(DrawPhase::None);
+            window.next_frame.scene.quads.clone()
+        })
+        .expect("test window should still exist")
+    }
+
+    #[gpui::test]
+    fn public_style_transform_translates_subtree(cx: &mut TestAppContext) {
+        let quads = paint_test_root(
+            div()
+                .w(px(20.))
+                .h(px(20.))
+                .transform(ElementTransform::default().translate(point(px(5.), px(10.))))
+                .child(TestQuadElement::new(
+                    Bounds::new(point(px(1.), px(2.)), size(px(3.), px(4.))),
+                    Hsla::default(),
+                )),
+            cx,
+        );
+
+        assert_eq!(quads.len(), 1);
+
+        let Some(quad) = quads.first() else {
+            panic!("styled transform should emit one quad");
+        };
+        assert_eq!(
+            quad.bounds.origin,
+            point(ScaledPixels(12.), ScaledPixels(24.))
+        );
+        assert_eq!(quad.bounds.size, size(ScaledPixels(6.), ScaledPixels(8.)));
+    }
+
+    #[gpui::test]
+    fn public_style_transform_scales_around_origin(cx: &mut TestAppContext) {
+        let quads = paint_test_root(
+            div()
+                .w(px(20.))
+                .h(px(20.))
+                .transform(
+                    ElementTransform::default()
+                        .scale(size(2., 2.))
+                        .origin(point(0.5, 0.5)),
+                )
+                .child(TestQuadElement::new(
+                    Bounds::new(point(px(11.), px(12.)), size(px(3.), px(4.))),
+                    Hsla::default(),
+                )),
+            cx,
+        );
+
+        assert_eq!(quads.len(), 1);
+
+        let Some(quad) = quads.first() else {
+            panic!("origin-scaled transform should emit one quad");
+        };
+        assert_eq!(
+            quad.bounds.origin,
+            point(ScaledPixels(24.), ScaledPixels(28.))
+        );
+        assert_eq!(quad.bounds.size, size(ScaledPixels(12.), ScaledPixels(16.)));
+    }
+
+    #[gpui::test]
+    fn public_style_transform_composes_nested_origins(cx: &mut TestAppContext) {
+        let quads = paint_test_root(
+            div()
+                .w(px(20.))
+                .h(px(20.))
+                .transform(
+                    ElementTransform::default()
+                        .scale(size(2., 2.))
+                        .origin(point(0.5, 0.5)),
+                )
+                .child(
+                    div()
+                        .w(px(10.))
+                        .h(px(10.))
+                        .transform(
+                            ElementTransform::default()
+                                .scale(size(2., 2.))
+                                .origin(point(0.5, 0.5)),
+                        )
+                        .child(TestQuadElement::new(
+                            Bounds::new(point(px(6.), px(7.)), size(px(2.), px(3.))),
+                            Hsla::default(),
+                        )),
+                ),
+            cx,
+        );
+
+        assert_eq!(quads.len(), 1);
+
+        let Some(quad) = quads.first() else {
+            panic!("nested origin transforms should emit one quad");
+        };
+        assert_eq!(
+            quad.bounds.origin,
+            point(ScaledPixels(8.), ScaledPixels(16.))
+        );
+        assert_eq!(quad.bounds.size, size(ScaledPixels(16.), ScaledPixels(24.)));
     }
 
     #[gpui::test]
